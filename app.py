@@ -53,11 +53,20 @@ def hash_ip(ip):
     return hashlib.sha256((IP_SALT + "|" + ip).encode()).hexdigest()
 
 def client_ip():
-    """Real client IP. Railway sits behind a proxy, so trust the first X-Forwarded-For hop."""
-    xff = request.headers.get("X-Forwarded-For", "")
-    if xff:
-        return xff.split(",")[0].strip()
-    return request.remote_addr or "0.0.0.0"
+    """Real client IP. Railway/most hosts put the visitor's IP in X-Forwarded-For.
+    The LEFTMOST entry is the original client. If we can't determine a real public
+    IP, return None so we DON'T do duplicate matching on a shared proxy address."""
+    # Prefer standard proxy headers, leftmost = original client
+    for header in ("X-Forwarded-For", "X-Real-IP", "Cf-Connecting-Ip"):
+        val = request.headers.get(header, "")
+        if val:
+            first = val.split(",")[0].strip()
+            if first:
+                return first
+    # Do NOT fall back to remote_addr for duplicate detection: on a proxied host
+    # that's the platform's internal IP, identical for every visitor, which would
+    # make unrelated users look like they share an IP.
+    return None
 
 def check_ipqs(ip):
     """{vpn, proxy, tor, fraud_score, ok}. Fails OPEN (treats as clean) if no key/error."""
@@ -94,6 +103,7 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
 
 @app.route("/verify/<token>")
 def verify(token):
+    print(f"=== VERIFY ROUTE HIT v3 === token={token!r}", flush=True)
     # First, check if this token was ALREADY processed (e.g. link preloaded by
     # Discord/browser). If so, show the correct outcome instead of "expired".
     try:
@@ -137,13 +147,19 @@ def verify(token):
         pass
 
     ip  = client_ip()
-    iph = hash_ip(ip)
-    ipqs = check_ipqs(ip)
-
-    # duplicate-IP: is this hash already linked to a DIFFERENT discord user?
-    duplicate_of = _redis("GET", f"iplink:{iph}")
-    if duplicate_of == entry["discord_id"]:
-        duplicate_of = None  # same person re-verifying is fine
+    if ip:
+        iph = hash_ip(ip)
+        ipqs = check_ipqs(ip)
+        # duplicate-IP: is this hash already linked to a DIFFERENT discord user?
+        duplicate_of = _redis("GET", f"iplink:{iph}")
+        if duplicate_of == entry["discord_id"]:
+            duplicate_of = None  # same person re-verifying is fine
+    else:
+        # couldn't determine a real client IP -> don't flag on IP, don't store a link
+        iph = None
+        ipqs = {"vpn": False, "proxy": False, "tor": False, "fraud_score": None}
+        duplicate_of = None
+    print(f"VERIFY ip={ip!r} dup_of={duplicate_of!r} vpn={ipqs['vpn']} proxy={ipqs['proxy']}", flush=True)
 
     flagged = bool(ipqs["vpn"] or ipqs["proxy"] or ipqs["tor"] or duplicate_of)
 
@@ -171,7 +187,7 @@ def verify(token):
 
 @app.route("/")
 def home():
-    return "Verify service is running.", 200
+    return "Verify service is running. build=v4", 200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
