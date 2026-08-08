@@ -53,19 +53,32 @@ def hash_ip(ip):
     return hashlib.sha256((IP_SALT + "|" + ip).encode()).hexdigest()
 
 def client_ip():
-    """Real client IP. Railway/most hosts put the visitor's IP in X-Forwarded-For.
-    The LEFTMOST entry is the original client. If we can't determine a real public
-    IP, return None so we DON'T do duplicate matching on a shared proxy address."""
-    # Prefer standard proxy headers, leftmost = original client
-    for header in ("X-Forwarded-For", "X-Real-IP", "Cf-Connecting-Ip"):
-        val = request.headers.get(header, "")
-        if val:
-            first = val.split(",")[0].strip()
-            if first:
-                return first
-    # Do NOT fall back to remote_addr for duplicate detection: on a proxied host
-    # that's the platform's internal IP, identical for every visitor, which would
-    # make unrelated users look like they share an IP.
+    """Real client IP behind Railway's proxy. Railway appends its own proxy IP to
+    X-Forwarded-For, so the REAL client is usually the FIRST public (non-internal)
+    entry. We skip known internal/Google-Cloud ranges."""
+    xff = request.headers.get("X-Forwarded-For", "")
+    # one-time visibility: show the whole chain so we can confirm which is real
+    print(f"IP-DEBUG xff={xff!r} xreal={request.headers.get('X-Real-IP','')!r} "
+          f"remote={request.remote_addr!r}", flush=True)
+
+    def _is_internal(p):
+        return (p.startswith("10.") or p.startswith("192.168.") or
+                p.startswith("172.") or p.startswith("35.") or  # GCP/Railway egress
+                p.startswith("34.") or p.startswith("100.64") or p == "127.0.0.1")
+
+    if xff:
+        parts = [p.strip() for p in xff.split(",") if p.strip()]
+        # take the first entry that is NOT an internal/proxy address
+        for p in parts:
+            if not _is_internal(p):
+                return p
+        # if all look internal, fall back to the very first entry
+        if parts:
+            return parts[0]
+
+    xr = request.headers.get("X-Real-IP", "").strip()
+    if xr and not _is_internal(xr):
+        return xr
     return None
 
 def check_ipqs(ip):
@@ -103,7 +116,7 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
 
 @app.route("/verify/<token>")
 def verify(token):
-    print(f"=== VERIFY ROUTE HIT v3 === token={token!r}", flush=True)
+    print(f"=== VERIFY ROUTE HIT v5 === token={token!r}", flush=True)
     # First, check if this token was ALREADY processed (e.g. link preloaded by
     # Discord/browser). If so, show the correct outcome instead of "expired".
     try:
@@ -187,7 +200,7 @@ def verify(token):
 
 @app.route("/")
 def home():
-    return "Verify service is running. build=v4", 200
+    return "Verify service is running. build=v5", 200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
