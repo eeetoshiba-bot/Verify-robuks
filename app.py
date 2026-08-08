@@ -22,7 +22,8 @@ from flask import Flask, request, render_template_string
 app = Flask(__name__)
 
 # ---- config (set these as environment variables on Railway) ----
-IPQS_KEY    = os.getenv("IPQS_KEY", "")                # IPQualityScore Default API Key
+IPQS_KEY    = os.getenv("IPQS_KEY", "")                # (legacy, unused now)
+PROXYCHECK_KEY = os.getenv("PROXYCHECK_KEY", "")       # proxycheck.io API key (free 1000/day)
 IP_SALT     = os.getenv("IP_SALT", "change-me")        # makes stored IP hashes unreversible
 REDIS_URL   = os.getenv("UPSTASH_REDIS_REST_URL", "")  # from Upstash dashboard
 REDIS_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
@@ -100,24 +101,38 @@ def client_ip():
     return None
 
 def check_ipqs(ip):
-    """{vpn, proxy, tor, fraud_score, ok}. Fails OPEN (treats as clean) if no key/error."""
-    if not IPQS_KEY:
-        print("IPQS: no key set -> skipping VPN check", flush=True)
+    """VPN/proxy/Tor detection via proxycheck.io. Free tier: 1,000/day.
+    Set PROXYCHECK_KEY env var. Fails OPEN (treats as clean) on error/no key.
+    Function name kept as check_ipqs so the rest of the code is unchanged.
+    """
+    if not PROXYCHECK_KEY:
+        print("PROXYCHECK: no key set -> skipping VPN check", flush=True)
         return {"vpn": False, "proxy": False, "tor": False, "fraud_score": None, "ok": True}
     try:
-        url = f"https://ipqualityscore.com/api/json/ip/{quote(IPQS_KEY)}/{quote(ip)}?strictness=2&allow_public_access_points=true"
-        r = requests.get(url, timeout=10).json()
-        print(f"IPQS raw for {ip}: success={r.get('success')} vpn={r.get('vpn')} "
-              f"proxy={r.get('proxy')} tor={r.get('tor')} active_vpn={r.get('active_vpn')} "
-              f"fraud_score={r.get('fraud_score')} msg={r.get('message')!r}", flush=True)
+        # vpn=1 enables VPN detection, risk=1 adds a risk score (0-100)
+        url = f"https://proxycheck.io/v2/{quote(ip)}?key={quote(PROXYCHECK_KEY)}&vpn=1&risk=1"
+        resp = requests.get(url, timeout=15)
+        print(f"PROXYCHECK http_status={resp.status_code} for {ip}", flush=True)
+        data = resp.json()
+        node = data.get(ip, {}) if isinstance(data, dict) else {}
+        status = data.get("status")
+        # proxycheck returns proxy: "yes"/"no"; type can be "VPN","TOR","PUB",...
+        is_proxy = str(node.get("proxy", "no")).lower() == "yes"
+        ptype = str(node.get("type", "")).upper()
+        is_vpn = is_proxy and ptype in ("VPN", "COMPROMISED", "COMPROMISED SERVER")
+        is_tor = ptype == "TOR"
+        risk = node.get("risk")
+        print(f"PROXYCHECK raw for {ip}: status={status} proxy={node.get('proxy')} "
+              f"type={node.get('type')} risk={risk}", flush=True)
         return {
-            "vpn": bool(r.get("vpn") or r.get("active_vpn")),
-            "proxy": bool(r.get("proxy")),
-            "tor": bool(r.get("tor") or r.get("active_tor")),
-            "fraud_score": r.get("fraud_score"),
-            "ok": bool(r.get("success", False)),
+            "vpn": bool(is_vpn),
+            "proxy": bool(is_proxy),   # any proxy (incl VPN) counts as proxy
+            "tor": bool(is_tor),
+            "fraud_score": risk if isinstance(risk, (int, float)) else None,
+            "ok": status == "ok",
         }
-    except Exception:
+    except Exception as ex:
+        print(f"PROXYCHECK ERROR for {ip}: {type(ex).__name__}: {ex}", flush=True)
         return {"vpn": False, "proxy": False, "tor": False, "fraud_score": None, "ok": False}
 
 # ---------------- the verify page ----------------
@@ -264,7 +279,7 @@ def myip():
 
 @app.route("/")
 def home():
-    return "Verify service is running. build=v14-vpn", 200
+    return "Verify service is running. build=v16-proxycheck", 200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
