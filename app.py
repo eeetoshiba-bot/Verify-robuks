@@ -190,6 +190,18 @@ def verify(token):
     return render_template_string(PAGE, cls="ok", icon="✅",
         title="Verified!", msg="Head back to Discord — your role has been granted. 🎉")
 
+@app.route("/myip")
+def myip():
+    xff   = request.headers.get("X-Forwarded-For", "")
+    xreal = request.headers.get("X-Real-IP", "")
+    cfip  = request.headers.get("Cf-Connecting-Ip", "")
+    picked = client_ip()
+    return (f"<pre>picked_ip = {picked}\n\n"
+            f"X-Forwarded-For = {xff}\n"
+            f"X-Real-IP = {xreal}\n"
+            f"CF-Connecting-IP = {cfip}\n"
+            f"remote_addr = {request.remote_addr}\n</pre>"), 200
+
 @app.route("/")
 def home():
     return "Verify service is running. build=v8-render", 200
