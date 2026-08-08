@@ -102,14 +102,18 @@ def client_ip():
 def check_ipqs(ip):
     """{vpn, proxy, tor, fraud_score, ok}. Fails OPEN (treats as clean) if no key/error."""
     if not IPQS_KEY:
+        print("IPQS: no key set -> skipping VPN check", flush=True)
         return {"vpn": False, "proxy": False, "tor": False, "fraud_score": None, "ok": True}
     try:
-        url = f"https://ipqualityscore.com/api/json/ip/{quote(IPQS_KEY)}/{quote(ip)}?strictness=1"
+        url = f"https://ipqualityscore.com/api/json/ip/{quote(IPQS_KEY)}/{quote(ip)}?strictness=2&allow_public_access_points=true"
         r = requests.get(url, timeout=10).json()
+        print(f"IPQS raw for {ip}: success={r.get('success')} vpn={r.get('vpn')} "
+              f"proxy={r.get('proxy')} tor={r.get('tor')} active_vpn={r.get('active_vpn')} "
+              f"fraud_score={r.get('fraud_score')} msg={r.get('message')!r}", flush=True)
         return {
-            "vpn": bool(r.get("vpn")),
+            "vpn": bool(r.get("vpn") or r.get("active_vpn")),
             "proxy": bool(r.get("proxy")),
-            "tor": bool(r.get("tor")),
+            "tor": bool(r.get("tor") or r.get("active_tor")),
             "fraud_score": r.get("fraud_score"),
             "ok": bool(r.get("success", False)),
         }
@@ -181,20 +185,36 @@ def verify(token):
     if ip:
         iph = hash_ip(ip)
         ipqs = check_ipqs(ip)
-        # duplicate-IP: is this EXACT IP already linked to a DIFFERENT discord user?
-        duplicate_of = _redis("GET", f"iplink:{iph}")
-        if duplicate_of == entry["discord_id"]:
-            duplicate_of = None  # same person re-verifying is fine
-        # store the link IMMEDIATELY (not via the bot poller) so the very next
-        # person on this IP is detected without a timing gap
-        _redis("SET", f"iplink:{iph}", entry["discord_id"])
+        # duplicate-IP check is PER-SERVER: only matches other users who verified
+        # in the SAME guild. Different servers have independent IP tracking.
+        gid = str(entry["guild_id"])
+        me  = str(entry["discord_id"])
+        stored = _redis("GET", f"iplink:{gid}:{iph}")
+        stored = str(stored).strip().strip('"') if stored is not None else None
+        # only a DIFFERENT user on the same IP counts as a duplicate
+        if stored and stored != me:
+            duplicate_of = stored
+        else:
+            duplicate_of = None
+        # (re)store MY id for this IP+guild so future OTHER users are caught
+        _redis("SET", f"iplink:{gid}:{iph}", me)
+        # if a mod previously approved this user in this server, never re-flag them
+        if duplicate_of:
+            try:
+                if _redis("GET", f"cleared:{gid}:{me}"):
+                    duplicate_of = None
+            except Exception:
+                pass
     else:
         iph = None
         ipqs = {"vpn": False, "proxy": False, "tor": False, "fraud_score": None}
         duplicate_of = None
-    print(f"VERIFY ip={ip!r} dup_of={duplicate_of!r} vpn={ipqs['vpn']} proxy={ipqs['proxy']} tor={ipqs['tor']}", flush=True)
+    fs = ipqs.get("fraud_score")
+    high_fraud = isinstance(fs, (int, float)) and fs >= 85
+    print(f"VERIFY ip={ip!r} dup_of={duplicate_of!r} vpn={ipqs['vpn']} proxy={ipqs['proxy']} "
+          f"tor={ipqs['tor']} fraud={fs} high_fraud={high_fraud}", flush=True)
 
-    flagged = bool(ipqs["vpn"] or ipqs["proxy"] or ipqs["tor"] or duplicate_of)
+    flagged = bool(ipqs["vpn"] or ipqs["proxy"] or ipqs["tor"] or duplicate_of or high_fraud)
 
     # If we could NOT determine a real client IP, this is almost certainly a
     # header-less preload/bot request (not the actual user). Do NOT finalize:
@@ -244,7 +264,7 @@ def myip():
 
 @app.route("/")
 def home():
-    return "Verify service is running. build=v12", 200
+    return "Verify service is running. build=v14-vpn", 200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
