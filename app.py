@@ -160,6 +160,9 @@ def verify(token):
         duplicate_of = _redis("GET", f"iplink:{iph}")
         if duplicate_of == entry["discord_id"]:
             duplicate_of = None  # same person re-verifying is fine
+        # store the link IMMEDIATELY (not via the bot poller) so the very next
+        # person on this IP is detected without a timing gap
+        _redis("SET", f"iplink:{iph}", entry["discord_id"])
     else:
         iph = None
         ipqs = {"vpn": False, "proxy": False, "tor": False, "fraud_score": None}
@@ -170,6 +173,7 @@ def verify(token):
 
     result = {
         "discord_id": entry["discord_id"], "guild_id": entry["guild_id"],
+        "ip_debug": ip,   # real IP for console debugging
         "ip_hash": iph, "vpn": ipqs["vpn"], "proxy": ipqs["proxy"], "tor": ipqs["tor"],
         "fraud_score": ipqs["fraud_score"], "duplicate_of": duplicate_of,
         "flagged": flagged, "ts": int(time.time()),
@@ -204,7 +208,7 @@ def myip():
 
 @app.route("/")
 def home():
-    return "Verify service is running. build=v8-render", 200
+    return "Verify service is running. build=v9", 200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
