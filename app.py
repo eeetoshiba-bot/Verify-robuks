@@ -53,42 +53,51 @@ def hash_ip(ip):
     return hashlib.sha256((IP_SALT + "|" + ip).encode()).hexdigest()
 
 def _is_internal_ip(p):
-    """Internal/proxy ranges that are NOT a real visitor IP."""
+    """Internal/proxy ranges that are NOT a real visitor IP (incl. Cloudflare edge)."""
     p = (p or "").strip()
-    return (not p or
-            p.startswith("10.") or p.startswith("192.168.") or
-            p.startswith("127.") or p.startswith("169.254.") or
-            p.startswith("100.64.") or
-            p.startswith("172.16.") or p.startswith("172.17.") or
-            p.startswith("172.18.") or p.startswith("172.19.") or
-            p.startswith("172.2") or p.startswith("172.30.") or p.startswith("172.31.") or
-            p.startswith("35.") or p.startswith("34.") or   # GCP/Render internal
-            p.startswith("::1") or p.startswith("fd"))
+    if not p:
+        return True
+    prefixes = (
+        "10.", "192.168.", "127.", "169.254.", "100.64.",
+        "172.16.", "172.17.", "172.18.", "172.19.", "172.2", "172.30.", "172.31.",
+        "35.", "34.",                       # GCP / Render internal
+        "::1", "fd",
+        # Cloudflare IPv4 edge ranges (partial, the common ones)
+        "104.16.", "104.17.", "104.18.", "104.19.", "104.20.", "104.21.",
+        "104.22.", "104.23.", "104.24.", "104.25.", "104.26.", "104.27.",
+        "104.28.", "172.64.", "172.65.", "172.66.", "172.67.", "172.68.",
+        "172.69.", "172.70.", "172.71.", "173.245.", "108.162.", "141.101.",
+        "162.158.", "162.159.", "188.114.", "190.93.", "197.234.", "198.41.",
+        "131.0.72.",
+    )
+    return p.startswith(prefixes)
 
 def client_ip():
-    """Real public client IP behind Render's load balancer.
+    """Real public client IP.
 
-    The real client is the LEFTMOST X-Forwarded-For entry. Cloudflare header wins
-    if present. Crucially, if we only see an INTERNAL/proxy address (e.g. a
-    header-less preload request that falls back to Render's 35.x IP), we return
-    None so it is NOT used for duplicate matching — otherwise every such request
-    would look like the same user.
+    Render routes through Cloudflare, so the true visitor IP arrives in
+    Cf-Connecting-Ip. If that header is missing (e.g. a preload request that
+    doesn't carry it), we refuse to use a proxy/edge IP (Cloudflare/GCP/Render)
+    and return None, so the user's REAL click reprocesses with their true IP.
     """
     xff   = request.headers.get("X-Forwarded-For", "")
     xreal = request.headers.get("X-Real-IP", "")
     cfip  = request.headers.get("Cf-Connecting-Ip", "")
     print(f"IP-DEBUG xff={xff!r} xreal={xreal!r} cf={cfip!r} remote={request.remote_addr!r}", flush=True)
 
+    # 1) Cloudflare's own header is the single most reliable source of the real IP
     if cfip.strip() and not _is_internal_ip(cfip):
         return cfip.strip()
+    # 2) otherwise, first NON-proxy entry in X-Forwarded-For
     if xff.strip():
-        for part in xff.split(","):          # leftmost real public IP
+        for part in xff.split(","):
             part = part.strip()
             if part and not _is_internal_ip(part):
                 return part
+    # 3) X-Real-IP if it's a real address
     if xreal.strip() and not _is_internal_ip(xreal):
         return xreal.strip()
-    return None   # only internal/proxy IPs seen -> treat as unknown, never match
+    return None
 
 def check_ipqs(ip):
     """{vpn, proxy, tor, fraud_score, ok}. Fails OPEN (treats as clean) if no key/error."""
@@ -235,7 +244,7 @@ def myip():
 
 @app.route("/")
 def home():
-    return "Verify service is running. build=v11", 200
+    return "Verify service is running. build=v12", 200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
