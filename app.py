@@ -53,32 +53,41 @@ def hash_ip(ip):
     return hashlib.sha256((IP_SALT + "|" + ip).encode()).hexdigest()
 
 def client_ip():
-    """Real client IP behind Railway's proxy. Railway appends its own proxy IP to
-    X-Forwarded-For, so the REAL client is usually the FIRST public (non-internal)
-    entry. We skip known internal/Google-Cloud ranges."""
-    xff = request.headers.get("X-Forwarded-For", "")
-    # one-time visibility: show the whole chain so we can confirm which is real
-    print(f"IP-DEBUG xff={xff!r} xreal={request.headers.get('X-Real-IP','')!r} "
-          f"remote={request.remote_addr!r}", flush=True)
+    """Real public client IP behind Railway's proxy.
 
-    def _is_internal(p):
+    Railway/GCP forward the chain in X-Forwarded-For as:
+        <realclient>, <maybe more proxies>, <railway/gcp internal>
+    The REAL client is the FIRST entry that is a valid PUBLIC address.
+    We log the full header set so the true IP is always visible in logs.
+    """
+    xff   = request.headers.get("X-Forwarded-For", "")
+    xreal = request.headers.get("X-Real-IP", "")
+    cfip  = request.headers.get("Cf-Connecting-Ip", "")
+    print(f"IP-DEBUG xff={xff!r} xreal={xreal!r} cf={cfip!r} remote={request.remote_addr!r}", flush=True)
+
+    def _is_private_or_internal(p):
+        # RFC1918 private + GCP/Railway egress ranges + loopback
         return (p.startswith("10.") or p.startswith("192.168.") or
-                p.startswith("172.") or p.startswith("35.") or  # GCP/Railway egress
-                p.startswith("34.") or p.startswith("100.64") or p == "127.0.0.1")
+                p.startswith("127.") or p.startswith("169.254.") or
+                p.startswith("100.64.") or
+                p.startswith("172.") or          # 172.16-31 private (approx)
+                p.startswith("35.") or p.startswith("34.") or  # GCP/Railway
+                ":" in p and p.startswith("fd"))  # ULA IPv6
+
+    # Cloudflare, when present, is the single most reliable source
+    if cfip.strip():
+        return cfip.strip()
 
     if xff:
         parts = [p.strip() for p in xff.split(",") if p.strip()]
-        # take the first entry that is NOT an internal/proxy address
-        for p in parts:
-            if not _is_internal(p):
+        for p in parts:                       # leftmost real public IP = the client
+            if not _is_private_or_internal(p):
                 return p
-        # if all look internal, fall back to the very first entry
         if parts:
             return parts[0]
 
-    xr = request.headers.get("X-Real-IP", "").strip()
-    if xr and not _is_internal(xr):
-        return xr
+    if xreal.strip():
+        return xreal.strip()
     return None
 
 def check_ipqs(ip):
@@ -163,16 +172,15 @@ def verify(token):
     if ip:
         iph = hash_ip(ip)
         ipqs = check_ipqs(ip)
-        # duplicate-IP: is this hash already linked to a DIFFERENT discord user?
+        # duplicate-IP: is this EXACT IP already linked to a DIFFERENT discord user?
         duplicate_of = _redis("GET", f"iplink:{iph}")
         if duplicate_of == entry["discord_id"]:
             duplicate_of = None  # same person re-verifying is fine
     else:
-        # couldn't determine a real client IP -> don't flag on IP, don't store a link
         iph = None
         ipqs = {"vpn": False, "proxy": False, "tor": False, "fraud_score": None}
         duplicate_of = None
-    print(f"VERIFY ip={ip!r} dup_of={duplicate_of!r} vpn={ipqs['vpn']} proxy={ipqs['proxy']}", flush=True)
+    print(f"VERIFY ip={ip!r} dup_of={duplicate_of!r} vpn={ipqs['vpn']} proxy={ipqs['proxy']} tor={ipqs['tor']}", flush=True)
 
     flagged = bool(ipqs["vpn"] or ipqs["proxy"] or ipqs["tor"] or duplicate_of)
 
@@ -200,7 +208,7 @@ def verify(token):
 
 @app.route("/")
 def home():
-    return "Verify service is running. build=v5", 200
+    return "Verify service is running. build=v7", 200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
