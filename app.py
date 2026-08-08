@@ -94,15 +94,47 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
 
 @app.route("/verify/<token>")
 def verify(token):
+    # First, check if this token was ALREADY processed (e.g. link preloaded by
+    # Discord/browser). If so, show the correct outcome instead of "expired".
+    try:
+        done = _redis("GET", f"done:{token}")
+    except Exception:
+        done = None
+    if done:
+        if done == "flagged":
+            return render_template_string(PAGE, cls="flag", icon="🟡",
+                title="Verification received — pending review",
+                msg="Your connection was flagged (VPN/proxy or shared network). A moderator will "
+                    "review it shortly. If it's a false positive, you'll get your role.")
+        return render_template_string(PAGE, cls="ok", icon="✅",
+            title="Verified!", msg="Head back to Discord — your role has been granted. 🎉")
+
     try:
         raw = _redis("GET", f"pending:{token}")
-    except Exception:
+        print(f"VERIFY lookup: key=pending:{token!r} -> found={raw is not None} "
+              f"type={type(raw).__name__} value={str(raw)[:60]!r}", flush=True)
+    except Exception as ex:
+        print(f"VERIFY GET failed: {ex}", flush=True)
         return render_template_string(PAGE, cls="err", icon="✖",
             title="Service error", msg="Verification backend is unavailable. Try again shortly."), 500
     if not raw:
         return render_template_string(PAGE, cls="err", icon="✖",
             title="Invalid or expired link", msg="Press Verify again in Discord for a fresh link."), 404
     entry = json.loads(raw)
+
+    # if a near-simultaneous request already processed this token, show success
+    try:
+        if _redis("GET", f"consumed:{token}"):
+            d = _redis("GET", f"done:{token}")
+            if d == "flagged":
+                return render_template_string(PAGE, cls="flag", icon="🟡",
+                    title="Verification received — pending review",
+                    msg="Your connection was flagged (VPN/proxy or shared network). A moderator will "
+                        "review it shortly. If it's a false positive, you'll get your role.")
+            return render_template_string(PAGE, cls="ok", icon="✅",
+                title="Verified!", msg="Head back to Discord — your role has been granted. 🎉")
+    except Exception:
+        pass
 
     ip  = client_ip()
     iph = hash_ip(ip)
@@ -122,7 +154,12 @@ def verify(token):
         "flagged": flagged, "ts": int(time.time()),
     }
     _redis("RPUSH", "verify_results", json.dumps(result))
-    _redis("DEL", f"pending:{token}")   # one-time use
+    # remember the outcome so a preloaded/second/near-simultaneous view shows the
+    # right message instead of "expired". Keep the pending token too (don't delete)
+    # but shorten its life; the 'consumed' flag stops double-processing.
+    _redis("SET", f"done:{token}", "flagged" if flagged else "ok", "EX", "600")
+    _redis("SET", f"consumed:{token}", "1", "EX", "600")
+    _redis("EXPIRE", f"pending:{token}", "600")
 
     if flagged:
         return render_template_string(PAGE, cls="flag", icon="🟡",
