@@ -52,27 +52,43 @@ def _redis(*command):
 def hash_ip(ip):
     return hashlib.sha256((IP_SALT + "|" + ip).encode()).hexdigest()
 
+def _is_internal_ip(p):
+    """Internal/proxy ranges that are NOT a real visitor IP."""
+    p = (p or "").strip()
+    return (not p or
+            p.startswith("10.") or p.startswith("192.168.") or
+            p.startswith("127.") or p.startswith("169.254.") or
+            p.startswith("100.64.") or
+            p.startswith("172.16.") or p.startswith("172.17.") or
+            p.startswith("172.18.") or p.startswith("172.19.") or
+            p.startswith("172.2") or p.startswith("172.30.") or p.startswith("172.31.") or
+            p.startswith("35.") or p.startswith("34.") or   # GCP/Render internal
+            p.startswith("::1") or p.startswith("fd"))
+
 def client_ip():
     """Real public client IP behind Render's load balancer.
 
-    On Render, the real client is the LEFTMOST entry of X-Forwarded-For
-    (Render's LB appends its own hops to the right). Cloudflare header wins
-    if present. This also works on most standard proxied hosts.
+    The real client is the LEFTMOST X-Forwarded-For entry. Cloudflare header wins
+    if present. Crucially, if we only see an INTERNAL/proxy address (e.g. a
+    header-less preload request that falls back to Render's 35.x IP), we return
+    None so it is NOT used for duplicate matching — otherwise every such request
+    would look like the same user.
     """
     xff   = request.headers.get("X-Forwarded-For", "")
     xreal = request.headers.get("X-Real-IP", "")
     cfip  = request.headers.get("Cf-Connecting-Ip", "")
     print(f"IP-DEBUG xff={xff!r} xreal={xreal!r} cf={cfip!r} remote={request.remote_addr!r}", flush=True)
 
-    if cfip.strip():
+    if cfip.strip() and not _is_internal_ip(cfip):
         return cfip.strip()
     if xff.strip():
-        first = xff.split(",")[0].strip()
-        if first:
-            return first
-    if xreal.strip():
+        for part in xff.split(","):          # leftmost real public IP
+            part = part.strip()
+            if part and not _is_internal_ip(part):
+                return part
+    if xreal.strip() and not _is_internal_ip(xreal):
         return xreal.strip()
-    return None
+    return None   # only internal/proxy IPs seen -> treat as unknown, never match
 
 def check_ipqs(ip):
     """{vpn, proxy, tor, fraud_score, ok}. Fails OPEN (treats as clean) if no key/error."""
@@ -171,9 +187,20 @@ def verify(token):
 
     flagged = bool(ipqs["vpn"] or ipqs["proxy"] or ipqs["tor"] or duplicate_of)
 
+    # If we could NOT determine a real client IP, this is almost certainly a
+    # header-less preload/bot request (not the actual user). Do NOT finalize:
+    # show a neutral page and leave the token pending so the user's real click
+    # processes with their true IP.
+    if ip is None:
+        print("VERIFY skipped: no real client IP (preload/internal request)", flush=True)
+        return render_template_string(PAGE, cls="ok", icon="⏳",
+            title="Almost there…",
+            msg="Loading your verification — if this page doesn't update, tap the link once more.")
+
     result = {
         "discord_id": entry["discord_id"], "guild_id": entry["guild_id"],
         "ip_debug": ip,   # real IP for console debugging
+        "xff_debug": request.headers.get("X-Forwarded-For", ""),  # raw header for debugging
         "ip_hash": iph, "vpn": ipqs["vpn"], "proxy": ipqs["proxy"], "tor": ipqs["tor"],
         "fraud_score": ipqs["fraud_score"], "duplicate_of": duplicate_of,
         "flagged": flagged, "ts": int(time.time()),
@@ -208,7 +235,7 @@ def myip():
 
 @app.route("/")
 def home():
-    return "Verify service is running. build=v9", 200
+    return "Verify service is running. build=v11", 200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
