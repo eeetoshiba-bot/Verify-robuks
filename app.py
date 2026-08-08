@@ -32,9 +32,19 @@ def _redis(*command):
     """Run one Redis command via Upstash REST API. Returns the 'result' field."""
     if not REDIS_URL or not REDIS_TOKEN:
         raise RuntimeError("Upstash Redis env vars not set")
-    r = requests.post(REDIS_URL,
-                      headers={"Authorization": f"Bearer {REDIS_TOKEN}"},
-                      json=list(command), timeout=10)
+    url = REDIS_URL.rstrip("/")   # tolerate a trailing slash just in case
+    tok = REDIS_TOKEN.strip().strip('"').strip("'")   # tolerate stray quotes/spaces
+    try:
+        r = requests.post(url,
+                          headers={"Authorization": f"Bearer {tok}"},
+                          json=list(command), timeout=10)
+    except Exception as ex:
+        print(f"REDIS CONNECT FAIL: {ex}  (url={url[:40]}...)", flush=True)
+        raise
+    if r.status_code != 200:
+        # print the real reason to Railway logs so we can see it
+        print(f"REDIS HTTP {r.status_code}: {r.text[:200]}  "
+              f"(url_ok={url.endswith('.upstash.io')}, token_len={len(tok)})", flush=True)
     r.raise_for_status()
     return r.json().get("result")
 
